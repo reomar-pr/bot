@@ -28,7 +28,7 @@ from config import TELEGRAM_BOT_TOKEN
 
 # إعداد التسجيل للمساعدة في تتبع الأخطاء
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
     handlers=[
         logging.FileHandler("bot_log.log", encoding="utf-8"),
@@ -45,6 +45,10 @@ MANAGE_LIST_QUESTIONS, SELECT_MANAGE_ACTION, ASK_SHARE_GROUP_ID, CONFIRM_DELETE 
 # حالات عرض الإجابات
 SELECT_QUESTION = 7
 AWAITING_REPLY = 8
+
+# حالات محادثة البث للمجموعات (تحديث)
+BROADCAST_MESSAGE = 9
+BROADCAST_GROUP_IDS = 10
 
 # قاموس لحفظ الأسئلة وإجابات الطلاب
 questions_db = {}  # سيخزن {question_id: {'question': text, 'options': [], 'answers': {user_id: {'answer': answer, 'name': name, 'username': username}}}}
@@ -115,12 +119,17 @@ def save_data():
 
     # حفظ البيانات
     try:
-        with open('quiz_data.json', 'w', encoding='utf-8') as f:
+        # Atomic write: write to a temp file then replace
+        temp_file = 'quiz_data.json.tmp'
+        with open(temp_file, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
-        logger.info("تم حفظ البيانات بنجاح")
+        os.replace(temp_file, 'quiz_data.json')  # atomic on most OSes
+        logger.info("تم حفظ البيانات بنجاح (atomic write)")
         return True
     except Exception as e:
-        logger.error(f"خطأ في حفظ البيانات: {e}")
+        logger.error(f"Error saving data: {e}", exc_info=True)
+        # For manual restore, rename quiz_data.json.tmp to quiz_data.json if it exists
+        # and quiz_data.json is corrupted or missing.
         return False
 
 def load_data():
@@ -264,19 +273,27 @@ async def _generate_question_list_markup(callback_prefix: str):
 
 async def ask_question_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """يبدأ عملية إنشاء سؤال جديد."""
+    if not update.message or not update.message.from_user:
+        return ConversationHandler.END
     user = update.message.from_user
     if not is_authorized(user):
         return await unauthorized_access(update, context)
 
-    await update.message.reply_text("ما السؤال الذي تودّ طرحه على الطلاب؟")
+    if update.message:
+        await update.message.reply_text("ما السؤال الذي تودّ طرحه على الطلاب؟")
     # تنظيف بيانات المستخدم القديمة
-    context.user_data.clear()
+    if context.user_data is not None:
+        context.user_data.clear()
     return ASK_QUESTION
 
 async def ask_question_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """يستقبل نص السؤال."""
     global question_counter
 
+    if not update.message or not update.message.text:
+        return ConversationHandler.END
+    if context.user_data is None:
+        return ConversationHandler.END
     context.user_data['new_question_text'] = update.message.text
     context.user_data['options'] = []
 
@@ -285,7 +302,11 @@ async def ask_question_received(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def receive_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """يستقبل خيارات الإجابة."""
+    if not update.message or not update.message.text:
+        return ASK_OPTIONS
     option = update.message.text.strip() # إزالة المسافات الزائدة
+    if context.user_data is None:
+        return ASK_OPTIONS
     if option: # التأكد من أن الخيار ليس فارغاً
         context.user_data.setdefault('options', []).append(option) # طريقة آمنة للإضافة للقائمة
         await update.message.reply_text(f"أُضيفت الإجابة: {option}")
@@ -295,18 +316,24 @@ async def receive_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def done_adding_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ينهي إضافة الخيارات وينتقل لطلب معرفات المجموعات."""
-    if not context.user_data.get('options'):
-        await update.message.reply_text("لم تقم بإدخال أي إجابات! الرجاء إدخال إجابة واحدة على الأقل أو استخدم /cancel.")
+    if context.user_data is None or not context.user_data.get('options'):
+        if update.message:
+            await update.message.reply_text("لم تقم بإدخال أي إجابات! الرجاء إدخال إجابة واحدة على الأقل أو استخدم /cancel.")
         return ASK_OPTIONS # البقاء في نفس الحالة
-    
-    await update.message.reply_text("أُضيفت كل الإجابات بنجاح.\n\nالآن أرسل مُعرفات المجموعات التي تود نشر الرسالة بها (كل معرف في رسالة منفصلة، يجب أن يبدأ بـ -):")
+
+    if update.message:
+        await update.message.reply_text("أُضيفت كل الإجابات بنجاح.\n\nالآن أرسل مُعرفات المجموعات التي تود نشر الرسالة بها (كل معرف في رسالة منفصلة، يجب أن يبدأ بـ -):")
     context.user_data['group_ids'] = []
     return ASK_GROUP_IDS_CREATE
 
 async def receive_group_ids_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """يستقبل معرفات المجموعات لإنشاء السؤال."""
+    if not update.message or not update.message.text:
+        return ASK_GROUP_IDS_CREATE
     group_id = update.message.text.strip()
     # تحقق بسيط من أن المعرف قد يكون صالحًا (رقمي ويبدأ بـ - للمجموعات)
+    if context.user_data is None:
+        return ASK_GROUP_IDS_CREATE
     if group_id.startswith('-') and group_id[1:].isdigit():
         context.user_data.setdefault('group_ids', []).append(group_id)
         await update.message.reply_text(f"أُضيف مُعرف المجموعة: {group_id}\n\nإن انتهيت، أرسل السؤال للمجموعات باستخدام /send.")
@@ -318,17 +345,24 @@ async def send_new_question_to_groups(update: Update, context: ContextTypes.DEFA
     """ينشئ السؤال في قاعدة البيانات ويرسله للمجموعات المحددة."""
     global question_counter, questions_db
 
+    if context.user_data is None:
+        if update.message:
+            await update.message.reply_text("حدث خطأ، معلومات السؤال غير مكتملة. الرجاء البدء من جديد بـ /ask.")
+        return ConversationHandler.END
     group_ids = context.user_data.get('group_ids', [])
     question_text = context.user_data.get('new_question_text')
     options = context.user_data.get('options', [])
 
     if not group_ids:
-        await update.message.reply_text("لم تقم بإدخال أي معرفات مجموعات! الرجاء إدخال معرف واحد على الأقل أو استخدم /cancel.")
+        if update.message:
+            await update.message.reply_text("لم تقم بإدخال أي معرفات مجموعات! الرجاء إدخال معرف واحد على الأقل أو استخدم /cancel.")
         return ASK_GROUP_IDS_CREATE
 
     if not question_text or not options:
-         await update.message.reply_text("حدث خطأ، معلومات السؤال غير مكتملة. الرجاء البدء من جديد بـ /ask.")
-         context.user_data.clear() # تنظيف البيانات عند الخطأ
+         if update.message:
+             await update.message.reply_text("حدث خطأ، معلومات السؤال غير مكتملة. الرجاء البدء من جديد بـ /ask.")
+         if context.user_data is not None:
+             context.user_data.clear() # تنظيف البيانات عند الخطأ
          return ConversationHandler.END
 
     # إنشاء معرف فريد للسؤال الآن فقط
@@ -392,6 +426,8 @@ async def send_new_question_to_groups(update: Update, context: ContextTypes.DEFA
 async def receive_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """يستقبل إجابة الطالب عند النقر على زر."""
     query = update.callback_query
+    if not query or not query.data or not query.from_user:
+        return
     user = query.from_user
 
     # استخراج المعلومات من البيانات
@@ -422,14 +458,14 @@ async def receive_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # تسجيل الإجابة مع معلومات المستخدم
     try:
         # الحصول على معرف المجموعة من الرسالة
-        group_id = query.message.chat_id
+        group_id = query.message.chat_id if query.message and hasattr(query.message, 'chat_id') else None
 
         questions_db[question_id]['answers'][str(user.id)] = {
             'answer': answer,
-            'name': f"{user.first_name} {user.last_name}".strip() if user.last_name else user.first_name or "مستخدم",
+            'name': f"{user.first_name} {user.last_name}".strip() if getattr(user, 'last_name', None) else user.first_name or "مستخدم",
             'username': user.username or "غير متوفر",
             'timestamp': datetime.datetime.now().isoformat(),
-            'group_id': str(group_id)  # إضافة معرف المجموعة
+            'group_id': str(group_id) if group_id else "غير متوفر"  # إضافة معرف المجموعة
         }
         save_data()
         await query.answer(f"تم تسجيل إجابتك: {answer}", show_alert=True)
@@ -441,9 +477,9 @@ async def receive_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user.id,
             answer,
             {
-                'name': f"{user.first_name} {user.last_name}".strip() if user.last_name else user.first_name or "مستخدم",
+                'name': f"{user.first_name} {user.last_name}".strip() if getattr(user, 'last_name', None) else user.first_name or "مستخدم",
                 'username': user.username or "غير متوفر",
-                'group_id': str(query.message.chat_id)  # إضافة معرف المجموعة
+                'group_id': str(query.message.chat_id) if query.message and hasattr(query.message, 'chat_id') else "غير متوفر"  # إضافة معرف المجموعة
             }
         )
         await query.answer("حدث خطأ أثناء تسجيل الإجابة. سيتم حفظها ومعالجتها لاحقًا.", show_alert=True)
@@ -530,7 +566,7 @@ async def show_question_manage_options(update: Update, context: ContextTypes.DEF
             await query.delete_message()
         except:
             pass
-        
+
         await query.message.reply_text(
             text=message,
             reply_markup=reply_markup,
@@ -625,7 +661,7 @@ async def prompt_delete_confirmation(update: Update, context: ContextTypes.DEFAU
         await query.edit_message_text(
             f"🚨 *تحذير:* هل أنت متأكد أنك تريد حذف السؤال *{question_id}* وكل إجاباته؟\n\n"
             f"_{questions_db[question_id]['question']}_\n\n"
-            f"*لا يمكن التراجع عن هذا الإجراء!*", 
+            f"*لا يمكن التراجع عن هذا الإجراء!*",
             reply_markup=reply_markup,
             parse_mode=ParseMode.MARKDOWN
         )
@@ -635,7 +671,7 @@ async def prompt_delete_confirmation(update: Update, context: ContextTypes.DEFAU
          await query.message.reply_text(
             f"🚨 *تحذير:* هل أنت متأكد أنك تريد حذف السؤال *{question_id}* وكل إجاباته؟\n\n"
             f"_{questions_db[question_id]['question']}_\n\n"
-            f"*لا يمكن التراجع عن هذا الإجراء!*", 
+            f"*لا يمكن التراجع عن هذا الإجراء!*",
             reply_markup=reply_markup,
             parse_mode=ParseMode.MARKDOWN
         )
@@ -746,7 +782,7 @@ async def cancel_delete_back_to_options(update: Update, context: ContextTypes.DE
     try:
         await query.edit_message_text(
             f"*إدارة السؤال {question_id}:*\n_{question_text}_\n\n"
-            f"اختر الإجراء المطلوب:", 
+            f"اختر الإجراء المطلوب:",
             reply_markup=reply_markup,
             parse_mode=ParseMode.MARKDOWN
         )
@@ -754,7 +790,7 @@ async def cancel_delete_back_to_options(update: Update, context: ContextTypes.DE
         logger.warning(f"Could not edit message in cancel_delete: {e}")
         await query.message.reply_text(
             f"*إدارة السؤال {question_id}:*\n_{question_text}_\n\n"
-            f"اختر الإجراء المطلوب:", 
+            f"اختر الإجراء المطلوب:",
             reply_markup=reply_markup,
             parse_mode=ParseMode.MARKDOWN
         )
@@ -917,6 +953,13 @@ async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("لا توجد بيانات للتصدير حاليًا.")
         return
 
+    # Runtime check for xlsxwriter
+    try:
+        import xlsxwriter
+    except ImportError:
+        await update.message.reply_text("⚠️ مكتبة xlsxwriter غير مثبتة على الخادم. الرجاء تثبيتها باستخدام الأمر:\n\npip install xlsxwriter\n\nثم أعد تشغيل البوت.")
+        return
+
     # إنشاء نسخة من البيانات للتصدير
     export_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     export_filename = f"quiz_export_{export_time}.xlsx"
@@ -976,33 +1019,34 @@ async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """معالجة رسائل المستخدمين غير المصرح لهم"""
     global message_counter, user_messages, user_message_counts
-    
+
     # Check if this is a private chat with the bot
-    if update.message.chat.type != "private":
+    if not update.message or not update.message.chat or update.message.chat.type != "private":
         return
-    
-    user = update.message.from_user
-    
-    if not is_authorized(user):
-        message = update.message.text.strip()
-        
+
+    user = update.message.from_user if update.message else None
+
+    if user and not is_authorized(user):
+        message = update.message.text.strip() if update.message and update.message.text else ""
+
         message_id = str(message_counter)
         user_messages[message_id] = {
             'user_id': user.id,
-            'name': f"{user.first_name} {user.last_name or ''}".strip(),
+            'name': f"{user.first_name} {getattr(user, 'last_name', '')}".strip(),
             'username': user.username or "غير متوفر",
             'message': message,
             'timestamp': datetime.datetime.now().isoformat(),
             'replied': False
         }
-        
+
         # Update user message count
         user_message_counts[user.id] = user_message_counts.get(user.id, 0) + 1
-        
+
         message_counter += 1
         save_data()  # Save after adding new message
         await update.message.reply_text("أرسلت رسالتك بنجاح.")
-        context.user_data['awaiting_message'] = True  # Keep accepting messages
+        if context.user_data is not None:
+            context.user_data['awaiting_message'] = True  # Keep accepting messages
 
 async def list_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """عرض قائمة المستخدمين ورسائلهم"""
@@ -1039,11 +1083,11 @@ async def show_user_messages(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
 
     user_id = query.data.split(':')[1]
-    
+
     # Get all messages from this user
     user_msgs = []
     keyboard = []
-    
+
     for msg_id, data in user_messages.items():
         if str(data['user_id']) == user_id:
             status = "✅" if data['replied'] else "❌"
@@ -1090,10 +1134,10 @@ async def back_to_users_list(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """العودة لقائمة المستخدمين"""
     query = update.callback_query
     await query.answer()
-    
+
     if not is_authorized(query.from_user):
         return await unauthorized_access(update, context)
-    
+
     # Group messages by user
     users = {}
     for msg_id, data in user_messages.items():
@@ -1112,7 +1156,7 @@ async def back_to_users_list(update: Update, context: ContextTypes.DEFAULT_TYPE)
         keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"show_msgs:{user_id}")])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
+
     try:
         await query.edit_message_text(
             "اختر المستخدم لعرض رسائله:",
@@ -1158,7 +1202,7 @@ async def send_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_messages[msg_id]['replied'] = True
         save_data()  # Save after marking message as replied
         await update.message.reply_text("تم إرسال الرد بنجاح.")
-        
+
         # Show the users list again
         await list_messages(update, context)
         return ConversationHandler.END
@@ -1204,7 +1248,118 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "◾️ /cancel - لإلغاء العملية الحالية\n"
         "◾️ /export - تصدير البيانات\n"
         "◾️ /messages - عرض رسائل المستخدمين\n"
+        "◾️ /broadcast - إرسال رسالة مخصصة إلى المجموعات\n"
     )
+
+async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """بدء عملية البث: طلب الرسالة من المستخدم."""
+    if not is_authorized(update.message.from_user):
+        return await unauthorized_access(update, context)
+
+    await update.message.reply_text(
+        "أرسل رسالتك للبث:"
+    )
+    context.user_data.clear()  # تنظيف أي بيانات سابقة
+    return BROADCAST_MESSAGE
+
+async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة الرسالة المراد بثها وطلب معرفات المجموعات."""
+    if not update.message:
+        return BROADCAST_MESSAGE
+
+    # حفظ محتوى الرسالة
+    context.user_data['broadcast_data'] = {
+        'photo': None,
+        'text': None,
+        'photo_file_id': None,
+        'document': None,
+        'document_file_id': None
+    }
+
+    if update.message.photo:
+        # حفظ أكبر نسخة من الصورة
+        context.user_data['broadcast_data']['photo_file_id'] = update.message.photo[-1].file_id
+        context.user_data['broadcast_data']['text'] = update.message.caption
+
+    elif update.message.document:
+        # حفظ الملف
+        context.user_data['broadcast_data']['document_file_id'] = update.message.document.file_id
+        context.user_data['broadcast_data']['text'] = update.message.caption
+
+    elif update.message.text:
+        context.user_data['broadcast_data']['text'] = update.message.text
+    else:
+        await update.message.reply_text("الرجاء إرسال نص أو صورة أو ملف فقط.")
+        return BROADCAST_MESSAGE
+
+    await update.message.reply_text(
+        "تم استلام الرسالة. الآن أرسل معرفات المجموعات التي تريد البث إليها.\n"
+        "• يمكنك إرسال معرف واحد أو أكثر\n"
+        "• ضع كل معرف في سطر جديد\n"
+        "• يجب أن تبدأ المعرفات بـ '-'"
+    )
+    return BROADCAST_GROUP_IDS
+
+async def broadcast_group_ids(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إرسال الرسالة إلى المجموعات المحددة."""
+    if not update.message or not update.message.text:
+        await update.message.reply_text("الرجاء إرسال معرفات المجموعات.")
+        return BROADCAST_GROUP_IDS
+
+    # معالجة معرفات المجموعات
+    group_ids = update.message.text.strip().replace(',', '\n').splitlines()
+    group_ids = [gid.strip() for gid in group_ids if gid.strip() and gid.strip().startswith('-')]
+
+    if not group_ids:
+        await update.message.reply_text(
+            "لم يتم العثور على معرفات مجموعات صالحة.\n"
+            "تأكد أن كل معرف يبدأ بـ '-'"
+        )
+        return BROADCAST_GROUP_IDS
+
+    broadcast_data = context.user_data.get('broadcast_data', {})
+    text = broadcast_data.get('text')
+    photo_id = broadcast_data.get('photo_file_id')
+    document_id = broadcast_data.get('document_file_id')
+
+    success = []
+    errors = []
+
+    # إرسال الرسالة لكل مجموعة
+    for group_id in group_ids:
+        try:
+            if photo_id:
+                await context.bot.send_photo(
+                    chat_id=group_id,
+                    photo=photo_id,
+                    caption=text
+                )
+            elif document_id:
+                await context.bot.send_document(
+                    chat_id=group_id,
+                    document=document_id,
+                    caption=text
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=group_id,
+                    text=text
+                )
+            success.append(group_id)
+        except TelegramError as e:
+            errors.append(group_id)
+            logger.error(f"Error broadcasting to group {group_id}: {e}")
+
+    # إرسال تقرير النتائج
+    result_msg = "✅ نتائج عملية البث:\n\n"
+    if success:
+        result_msg += f"تم الإرسال بنجاح إلى {len(success)} مجموعة\n"
+    if errors:
+        result_msg += f"\n⚠️ فشل الإرسال إلى {len(errors)} مجموعة:\n{', '.join(errors)}"
+
+    await update.message.reply_text(result_msg)
+    context.user_data.clear()  # تنظيف البيانات بعد الانتهاء
+    return ConversationHandler.END
 
 def main():
     """النقطة الرئيسية للبوت."""
@@ -1216,6 +1371,29 @@ def main():
 
     # استخدام رمز API من config.py
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # --- ConversationHandler لإرسال رسالة مخصصة إلى المجموعات (/broadcast) ---
+    broadcast_handler = ConversationHandler(
+        entry_points=[CommandHandler('broadcast', broadcast_start)],
+        states={
+            BROADCAST_MESSAGE: [
+                MessageHandler(
+                    filters.TEXT | filters.PHOTO | filters.Document.ALL,
+                    broadcast_message
+                )
+            ],
+            BROADCAST_GROUP_IDS: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    broadcast_group_ids
+                )
+            ],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+        name="broadcast_conversation",
+        persistent=False
+    )
+    app.add_handler(broadcast_handler)
 
     # --- ConversationHandler لإنشاء سؤال جديد (/ask) ---
     create_question_handler = ConversationHandler(
@@ -1277,6 +1455,34 @@ def main():
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("export", export_data))
 
+    # --- ربط محادثات البوت ---
+    app.add_handler(create_question_handler)  # محادثة إنشاء سؤال
+    app.add_handler(manage_questions_handler) # محادثة إدارة الأسئلة
+    app.add_handler(reply_conv_handler)      # محادثة الرد على الرسائل الجديدة
+
+    # --- استقبال إجابات الطلاب ---
+    app.add_handler(CallbackQueryHandler(receive_answer, pattern=r"^ans:"))
+
+    # --- ربط وظائف الرسائل ---
+    app.add_handler(CallbackQueryHandler(show_user_messages, pattern=r"^show_msgs:"))
+    app.add_handler(CallbackQueryHandler(back_to_users_list, pattern=r"^back_to_users$"))
+    app.add_handler(CallbackQueryHandler(delete_message, pattern=r"^delete_msg:"))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        handle_user_message
+    ))
+    app.add_handler(CommandHandler("messages", list_messages))
+
+    # --- معالج إلغاء عام إضافي ---
+    app.add_handler(CommandHandler('cancel', cancel))
+
+    # تشغيل البوت
+    logger.info("Starting bot...")
+    app.run_polling()
+    logger.info("Bot stopped.")
+
+if __name__ == "__main__":
+    main()
     # --- ربط محادثات البوت ---
     app.add_handler(create_question_handler)  # محادثة إنشاء سؤال
     app.add_handler(manage_questions_handler) # محادثة إدارة الأسئلة
